@@ -1,52 +1,87 @@
-// ==========================================================
-// Sender Auditor v1.0
-// Author: Ernesto Mwangi
-// Terminal Edition
-// ==========================================================
 
 const axios = require("axios");
 const cheerio = require("cheerio");
 const chalk = require("chalk");
 const ora = require("ora");
+const dns = require("dns").promises;
+const tls = require("tls");
+const fs = require("fs");
+const crypto = require("crypto");
 const { performance } = require("perf_hooks");
 
 //===========================================================
-// CONFIG
+// CLI ARGS
 //===========================================================
 
-const TARGET = "https://aquatools.io";
+const rawArgs = process.argv.slice(2);
+const flags = rawArgs.filter(a => a.startsWith("--"));
+const positional = rawArgs.filter(a => !a.startsWith("--"));
+
+function normalizeTarget(url) {
+    if (!/^https?:\/\//i.test(url))
+        return "https://" + url;
+    return url;
+}
+
+const TARGET = normalizeTarget(positional[0] || "https://github.com");
+const TARGET_HOSTNAME = new URL(TARGET).hostname;
+
+const JSON_OUTPUT = flags.includes("--json");
+
+const watchFlag = flags.find(f => f.startsWith("--watch"));
+const WATCH_ENABLED = !!watchFlag;
+const WATCH_INTERVAL_MS = watchFlag && watchFlag.includes("=")
+    ? (parseInt(watchFlag.split("=")[1], 10) || 300) * 1000
+    : 300000;
 
 //===========================================================
-// GLOBAL REPORT OBJECT
+// REPORT FACTORY
 //===========================================================
 
-const report = {
-    target: TARGET,
-    status: "",
-    responseTime: "",
-    server: "",
-    contentType: "",
-    https: false,
-    htmlSize: 0,
+function freshReport() {
+    return {
+        target: TARGET,
+        status: "",
+        responseTime: "",
+        server: "",
+        contentType: "",
+        https: false,
+        htmlSize: 0,
+        headers: {},
+        contentHash: "",
 
-    title: "",
-    description: "",
-    language: "",
+        title: "",
+        description: "",
+        language: "",
 
-    links: [],
-    internalLinks: [],
-    externalLinks: [],
-    images: [],
-    scripts: [],
-    stylesheets: [],
-    headings: [],
+        links: [],
+        internalLinks: [],
+        externalLinks: [],
+        images: [],
+        scripts: [],
+        stylesheets: [],
+        headings: [],
 
-    emails: [],
-    phones: [],
+        emails: [],
+        phones: [],
 
-    robots: false,
-    sitemap: false
-};
+        robots: false,
+        sitemap: false,
+
+        dns: {},
+        ip: null,
+        geo: null,
+
+        ssl: null,
+
+        securityHeaders: {},
+
+        brokenLinks: [],
+
+        osGuess: "",
+        techStack: []
+    };
+}
 
 //===========================================================
 // UI
@@ -74,11 +109,15 @@ function error(msg) {
     console.log(chalk.red("✗ " + msg));
 }
 
+function sleep(ms) {
+    return new Promise(resolve => setTimeout(resolve, ms));
+}
+
 //===========================================================
 // FETCH PAGE
 //===========================================================
 
-async function fetchPage(url) {
+async function fetchPage(report, url) {
 
     const spinner = ora("Connecting...").start();
 
@@ -114,10 +153,20 @@ async function fetchPage(url) {
 
         report.https = url.startsWith("https://");
 
-        report.htmlSize =
-            Buffer.byteLength(response.data, "utf8");
+        report.headers = response.headers;
 
-        return response.data;
+        const html =
+            typeof response.data === "string"
+                ? response.data
+                : JSON.stringify(response.data);
+
+        report.htmlSize =
+            Buffer.byteLength(html, "utf8");
+
+        report.contentHash =
+            crypto.createHash("sha256").update(html).digest("hex").slice(0, 12);
+
+        return html;
 
     } catch (err) {
 
@@ -133,7 +182,7 @@ async function fetchPage(url) {
 // PARSE HTML
 //===========================================================
 
-function parseHTML(html) {
+function parseHTML(report, html) {
 
     const $ = cheerio.load(html);
 
@@ -185,16 +234,27 @@ function parseHTML(html) {
         if (!href)
             return;
 
+        if (
+            href.startsWith("mailto:") ||
+            href.startsWith("tel:") ||
+            href.startsWith("javascript:") ||
+            href.startsWith("#")
+        )
+            return;
+
         report.links.push(href);
 
-        if (
-            href.startsWith("http") &&
-            !href.includes(new URL(TARGET).hostname)
-        ) {
+        try {
 
-            report.externalLinks.push(href);
+            const resolved = new URL(href, TARGET);
 
-        } else {
+            if (resolved.hostname === TARGET_HOSTNAME) {
+                report.internalLinks.push(href);
+            } else {
+                report.externalLinks.push(href);
+            }
+
+        } catch {
 
             report.internalLinks.push(href);
 
@@ -208,7 +268,7 @@ function parseHTML(html) {
 // EXTRACT EMAILS
 //===========================================================
 
-function extractEmails(html) {
+function extractEmails(report, html) {
 
     const regex =
         /[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}/g;
@@ -218,7 +278,14 @@ function extractEmails(html) {
     if (!found)
         return;
 
-    report.emails = [...new Set(found)];
+    const assetExtensions =
+        /\.(png|jpe?g|gif|webp|svg|ico|bmp|css|js|json|woff2?|ttf)$/i;
+
+    const filtered = found.filter(
+        email => !assetExtensions.test(email)
+    );
+
+    report.emails = [...new Set(filtered)];
 
 }
 
@@ -226,10 +293,10 @@ function extractEmails(html) {
 // EXTRACT PHONES
 //===========================================================
 
-function extractPhones(html) {
+function extractPhones(report, html) {
 
     const regex =
-        /(\+?\d[\d\s\-()]{7,}\d)/g;
+        /(?=[\d\s\-()]{8,}\d)(\+?\d[\d\s\-()]*[\-\s()][\d\s\-()]*\d)/g;
 
     const found = html.match(regex);
 
@@ -244,14 +311,14 @@ function extractPhones(html) {
 // CHECK ROBOTS
 //===========================================================
 
-async function checkRobots() {
+async function checkRobots(report) {
 
     try {
 
         const url =
             new URL("/robots.txt", TARGET).href;
 
-        const response = await axios.get(url);
+        const response = await axios.get(url, { timeout: 15000 });
 
         report.robots =
             response.status === 200;
@@ -268,14 +335,14 @@ async function checkRobots() {
 // CHECK SITEMAP
 //===========================================================
 
-async function checkSitemap() {
+async function checkSitemap(report) {
 
     try {
 
         const url =
             new URL("/sitemap.xml", TARGET).href;
 
-        const response = await axios.get(url);
+        const response = await axios.get(url, { timeout: 15000 });
 
         report.sitemap =
             response.status === 200;
@@ -288,15 +355,319 @@ async function checkSitemap() {
 
 }
 
+//===========================================================
+// DNS RECORDS + IP
+//===========================================================
 
+async function checkDNS(report) {
+
+    const recordTypes = ["A", "AAAA", "MX", "NS", "TXT", "CNAME"];
+
+    for (const type of recordTypes) {
+
+        try {
+
+            const records = await dns.resolve(TARGET_HOSTNAME, type);
+
+            report.dns[type] =
+                type === "TXT"
+                    ? records.map(r => r.join(""))
+                    : records;
+
+        } catch {
+
+            report.dns[type] = [];
+
+        }
+
+    }
+
+    report.ip =
+        (report.dns.A && report.dns.A[0]) || null;
+
+}
+
+//===========================================================
+// SSL CERTIFICATE
+//===========================================================
+
+function checkSSL(report) {
+
+    return new Promise(resolve => {
+
+        if (!TARGET.startsWith("https://")) {
+            report.ssl = null;
+            return resolve();
+        }
+
+        const socket = tls.connect(
+            {
+                host: TARGET_HOSTNAME,
+                port: 443,
+                servername: TARGET_HOSTNAME,
+                timeout: 10000
+            },
+            () => {
+
+                const cert = socket.getPeerCertificate();
+
+                if (cert && cert.valid_to) {
+
+                    const validTo = new Date(cert.valid_to);
+                    const daysRemaining =
+                        Math.round((validTo - Date.now()) / 86400000);
+
+                    report.ssl = {
+                        issuer: (cert.issuer && cert.issuer.O) || "Unknown",
+                        validFrom: cert.valid_from,
+                        validTo: cert.valid_to,
+                        daysRemaining
+                    };
+
+                } else {
+
+                    report.ssl = null;
+
+                }
+
+                socket.end();
+                resolve();
+
+            }
+        );
+
+        socket.on("error", () => {
+            report.ssl = null;
+            resolve();
+        });
+
+        socket.on("timeout", () => {
+            report.ssl = null;
+            socket.destroy();
+            resolve();
+        });
+
+    });
+
+}
+
+//===========================================================
+// SECURITY HEADERS AUDIT
+//===========================================================
+
+function auditSecurityHeaders(report) {
+
+    const checks = {
+        "Strict-Transport-Security": "strict-transport-security",
+        "Content-Security-Policy": "content-security-policy",
+        "X-Frame-Options": "x-frame-options",
+        "X-Content-Type-Options": "x-content-type-options",
+        "Referrer-Policy": "referrer-policy",
+        "Permissions-Policy": "permissions-policy"
+    };
+
+    for (const [label, key] of Object.entries(checks)) {
+        report.securityHeaders[label] = report.headers[key] || null;
+    }
+
+}
+
+//===========================================================
+// BROKEN LINK CHECKER
+//===========================================================
+
+async function checkBrokenLinks(report) {
+
+    const candidates = [...new Set(report.internalLinks)]
+        .map(href => {
+            try {
+                return new URL(href, TARGET).href;
+            } catch {
+                return null;
+            }
+        })
+        .filter(Boolean)
+        .slice(0, 25);
+
+    const concurrency = 5;
+    let index = 0;
+
+    async function worker() {
+
+        while (index < candidates.length) {
+
+            const url = candidates[index++];
+
+            try {
+
+                let res = await axios.head(url, {
+                    timeout: 8000,
+                    validateStatus: () => true,
+                    headers: { "User-Agent": "SenderAuditor/1.0" }
+                });
+
+                // Some servers reject HEAD outright — fall back to GET
+                // before concluding the link is broken.
+                if (res.status === 405) {
+                    res = await axios.get(url, {
+                        timeout: 8000,
+                        validateStatus: () => true,
+                        headers: { "User-Agent": "SenderAuditor/1.0" }
+                    });
+                }
+
+                if (res.status >= 400) {
+                    report.brokenLinks.push({ url, status: res.status });
+                }
+
+            } catch {
+
+                report.brokenLinks.push({ url, status: "ERROR" });
+
+            }
+
+        }
+
+    }
+
+    await Promise.all(
+        Array.from({ length: concurrency }, worker)
+    );
+
+}
+
+//===========================================================
+// GEO-IP LOOKUP (external service: ip-api.com)
+//===========================================================
+
+async function checkGeoIP(report) {
+
+    if (!report.ip) {
+        report.geo = null;
+        return;
+    }
+
+    try {
+
+        const res = await axios.get(
+            `http://ip-api.com/json/${report.ip}`,
+            { timeout: 8000 }
+        );
+
+        if (res.data && res.data.status === "success") {
+
+            report.geo = {
+                country: res.data.country,
+                region: res.data.regionName,
+                city: res.data.city,
+                isp: res.data.isp,
+                org: res.data.org
+            };
+
+        } else {
+
+            report.geo = null;
+
+        }
+
+    } catch {
+
+        report.geo = null;
+
+    }
+
+}
+
+//===========================================================
+// OS GUESS (best-effort, not reliable over HTTP alone)
+//===========================================================
+
+function guessOS(report) {
+
+    const server = (report.server || "").toLowerCase();
+    const poweredBy = (report.headers["x-powered-by"] || "").toLowerCase();
+    const combined = `${server} ${poweredBy}`;
+
+    if (combined.includes("win") || combined.includes("iis")) {
+        report.osGuess = "Likely Windows";
+    } else if (
+        combined.includes("ubuntu") ||
+        combined.includes("debian") ||
+        combined.includes("centos") ||
+        combined.includes("unix") ||
+        combined.includes("linux")
+    ) {
+        report.osGuess = "Likely Linux/Unix";
+    } else if (
+        combined.includes("nginx") ||
+        combined.includes("apache") ||
+        combined.includes("cloudflare")
+    ) {
+        report.osGuess = "Likely Linux/Unix (inferred from server software)";
+    } else {
+        report.osGuess = "Unknown — not reliably detectable over HTTP";
+    }
+
+}
+
+//===========================================================
+// TECH STACK DETECTION (signal-based, not certain)
+//===========================================================
+
+function detectTechStack(report, html) {
+
+    const signals = new Set();
+
+    const server = (report.server || "").toLowerCase();
+    const poweredBy = (report.headers["x-powered-by"] || "").toLowerCase();
+
+    if (server.includes("cloudflare")) signals.add("Cloudflare (CDN/proxy)");
+    if (server.includes("nginx")) signals.add("Nginx");
+    if (server.includes("apache")) signals.add("Apache");
+    if (poweredBy.includes("php")) signals.add("PHP");
+    if (poweredBy.includes("express")) signals.add("Express (Node.js)");
+    if (poweredBy.includes("asp.net")) signals.add("ASP.NET");
+
+    const $ = cheerio.load(html);
+    const generator = $('meta[name="generator"]').attr("content");
+
+    if (generator) signals.add(generator);
+
+    if (html.includes("wp-content") || html.includes("wp-includes")) signals.add("WordPress");
+    if (html.includes("_next/static")) signals.add("Next.js");
+    if (html.includes("create-react-app") || report.description.includes("create-react-app")) signals.add("React (Create React App)");
+    if (html.includes("__NUXT__")) signals.add("Nuxt.js");
+    if (html.includes("cdn.shopify.com")) signals.add("Shopify");
+    if (html.includes("wix.com") || html.includes("wixstatic.com")) signals.add("Wix");
+    if (html.toLowerCase().includes("squarespace")) signals.add("Squarespace");
+    if (html.includes("Drupal.settings")) signals.add("Drupal");
+
+    report.techStack = [...signals];
+
+}
+
+//===========================================================
+// JSON EXPORT
+//===========================================================
+
+function exportJSON(report) {
+
+    const filename = "report.json";
+
+    fs.writeFileSync(filename, JSON.stringify(report, null, 2));
+
+    success(`Report written to ${filename}`);
+
+}
 
 //===========================================================
 // PRINT REPORT
 //===========================================================
 
-function printReport() {
+function printReport(report) {
 
-    console.clear();
+    if (!WATCH_ENABLED)
+        console.clear();
 
     line();
     console.log(chalk.green.bold("          SENDER AUDITOR v1.0"));
@@ -309,12 +680,68 @@ function printReport() {
     console.log(chalk.white("Server           :"), report.server);
     console.log(chalk.white("Content Type     :"), report.contentType);
     console.log(chalk.white("HTML Size        :"), report.htmlSize + " bytes");
+    console.log(chalk.white("IP Address       :"), report.ip || "Unknown");
+    console.log(chalk.white("OS Guess         :"), report.osGuess);
 
     section("PAGE INFORMATION");
 
     console.log("Title            :", report.title || "None");
     console.log("Language         :", report.language);
     console.log("Description      :", report.description || "None");
+
+    section("TECH STACK (detected signals, not certain)");
+
+    if (report.techStack.length === 0) {
+        warning("No recognizable tech signals found.");
+    } else {
+        report.techStack.forEach(t => console.log("•", t));
+    }
+
+    section("DNS RECORDS");
+
+    for (const type of ["A", "AAAA", "MX", "NS", "CNAME", "TXT"]) {
+        const records = report.dns[type] || [];
+        console.log(
+            `${type.padEnd(6)}:`,
+            records.length ? records.join(", ") : "—"
+        );
+    }
+
+    section("GEO-IP (via ip-api.com)");
+
+    if (report.geo) {
+        console.log("Location         :", `${report.geo.city || "?"}, ${report.geo.region || "?"}, ${report.geo.country || "?"}`);
+        console.log("ISP              :", report.geo.isp || "Unknown");
+        console.log("Org              :", report.geo.org || "Unknown");
+    } else {
+        warning("Geo-IP lookup unavailable.");
+    }
+
+    section("SSL CERTIFICATE");
+
+    if (report.ssl) {
+        console.log("Issuer           :", report.ssl.issuer);
+        console.log("Valid From       :", report.ssl.validFrom);
+        console.log("Valid To         :", report.ssl.validTo);
+
+        if (report.ssl.daysRemaining <= 14) {
+            warning(`Expires in ${report.ssl.daysRemaining} days`);
+        } else {
+            console.log("Days Remaining   :", report.ssl.daysRemaining);
+        }
+    } else {
+        warning("No SSL certificate info (not HTTPS, or lookup failed).");
+    }
+
+    section("SECURITY HEADERS");
+
+    for (const [label, value] of Object.entries(report.securityHeaders)) {
+        if (value) {
+            success(`${label}: ${value}`);
+        } else {
+            warning(`${label}: Missing`);
+        }
+    }
 
     section("HEADINGS");
 
@@ -367,6 +794,14 @@ function printReport() {
             : chalk.red("NOT FOUND")
     );
 
+    section("BROKEN LINKS (first 25 internal links checked)");
+
+    if (report.brokenLinks.length === 0) {
+        success("No broken links detected.");
+    } else {
+        report.brokenLinks.forEach(b => error(`${b.status}  ${b.url}`));
+    }
+
     section("LINK PREVIEW");
 
     if (report.links.length === 0) {
@@ -395,10 +830,72 @@ function printReport() {
 }
 
 //===========================================================
+// DIFF (used in watch mode to flag changes between runs)
+//===========================================================
+
+function diffReports(prev, curr) {
+
+    if (prev.status !== curr.status) {
+        warning(`Status changed: ${prev.status} -> ${curr.status}`);
+    }
+
+    if (prev.contentHash !== curr.contentHash) {
+        warning("Page content changed since last check.");
+    }
+
+    if (
+        prev.ssl && curr.ssl &&
+        curr.ssl.daysRemaining <= 14 &&
+        prev.ssl.daysRemaining !== curr.ssl.daysRemaining
+    ) {
+        warning(`SSL certificate expiring soon: ${curr.ssl.daysRemaining} days remaining.`);
+    }
+
+    if (curr.robots !== prev.robots || curr.sitemap !== prev.sitemap) {
+        warning("robots.txt / sitemap.xml availability changed.");
+    }
+
+}
+
+//===========================================================
+// RUN A SINGLE AUDIT PASS
+//===========================================================
+
+async function runAudit() {
+
+    const report = freshReport();
+
+    const html = await fetchPage(report, TARGET);
+
+    parseHTML(report, html);
+    extractEmails(report, html);
+    extractPhones(report, html);
+    detectTechStack(report, html);
+
+    await Promise.all([
+        checkRobots(report),
+        checkSitemap(report),
+        checkSSL(report),
+        checkDNS(report)
+    ]);
+
+    guessOS(report);
+    auditSecurityHeaders(report);
+
+    await Promise.all([
+        checkGeoIP(report),
+        checkBrokenLinks(report)
+    ]);
+
+    return report;
+
+}
+
+//===========================================================
 // MAIN
 //===========================================================
 
-async function main() {
+async function runOnce() {
 
     try {
 
@@ -406,30 +903,72 @@ async function main() {
         console.log(chalk.green.bold("Starting Sender Auditor"));
         line();
 
-        const html = await fetchPage(TARGET);
+        const report = await runAudit();
 
-        parseHTML(html);
-
-        extractEmails(html);
-
-        extractPhones(html);
-
-        await checkRobots();
-
-        await checkSitemap();
-
-        printReport();
+        if (JSON_OUTPUT) {
+            exportJSON(report);
+        } else {
+            printReport(report);
+        }
 
     } catch (err) {
 
         error("Audit Failed");
-
         console.log();
+        console.log(chalk.red(err.message));
 
-        console.log(
-            chalk.red(err.message)
-        );
+    }
 
+}
+
+async function runWatch() {
+
+    console.log(
+        chalk.cyan.bold(
+            `Watch mode enabled — checking every ${WATCH_INTERVAL_MS / 1000}s. Press Ctrl+C to stop.`
+        )
+    );
+
+    let previous = null;
+
+    while (true) {
+
+        try {
+
+            const report = await runAudit();
+
+            if (JSON_OUTPUT) {
+                exportJSON(report);
+            } else {
+                printReport(report);
+            }
+
+            if (previous) {
+                section("CHANGES SINCE LAST CHECK");
+                diffReports(previous, report);
+            }
+
+            previous = report;
+
+        } catch (err) {
+
+            error("Audit Failed");
+            console.log(chalk.red(err.message));
+
+        }
+
+        await sleep(WATCH_INTERVAL_MS);
+
+    }
+
+}
+
+async function main() {
+
+    if (WATCH_ENABLED) {
+        await runWatch();
+    } else {
+        await runOnce();
     }
 
 }
